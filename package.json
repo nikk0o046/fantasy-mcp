@@ -1,0 +1,18 @@
+{
+  "name": "fantasy-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for reading FIFA Fantasy teams (bootstrap + session-lifetime measurement phase)",
+  "main": "index.js",
+  "scripts": {
+    "bootstrap": "node bootstrap.mjs",
+    "measure": "node measure.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "playwright": "^1.60.0"
+  }
+}

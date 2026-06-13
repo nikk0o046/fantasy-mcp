@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Node / Playwright
+node_modules/
+package-lock.json
+
+# FIFA session secrets — NEVER commit
+.env
+session.json
+session.b64
+*.png
