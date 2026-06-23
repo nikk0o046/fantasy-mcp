@@ -57,22 +57,35 @@ const ctx = await browser.newContext({
 });
 const page = await ctx.newPage();
 
-// Sniff the credentials the app actually uses on its API calls. The Fantasy data
-// API (proxied to Genius Sports) authenticates with an Authorization bearer token
-// and sometimes extra x-* headers — NOT cookies. We capture them from live traffic.
+// Diagnostic capture: record EVERY Fantasy/Genius API call the app makes — its
+// status and exactly what auth it carries — so we can see how a working request is
+// authenticated (bearer? cookie? custom header?) instead of guessing.
 const captured = { authorization: null, extraHeaders: {}, sampleUrl: null };
-const INTERESTING = /authorization|^x-|entity|tenant|api-key|token/i;
-page.on('request', (req) => {
-  const u = req.url();
-  if (!/\/api\/|geniussports\.com|f2p\.media/.test(u)) return;
-  const h = req.headers();
-  if (h['authorization']) {
-    captured.authorization = h['authorization'];
-    captured.sampleUrl = u;
-    for (const [k, v] of Object.entries(h)) {
-      if (INTERESTING.test(k) && k !== 'authorization' && k !== 'accept') captured.extraHeaders[k] = v;
+const apiLog = [];
+const isApi = (u) => /\/api\/|geniussports\.com|f2p\.media/.test(u);
+const xOf = (h) => Object.fromEntries(Object.entries(h).filter(([k]) => /^x-|entity|tenant|api-key|client/i.test(k)));
+page.on('response', async (res) => {
+  try {
+    const req = res.request();
+    const u = req.url();
+    if (!isApi(u)) return;
+    const h = req.headers();
+    const status = res.status();
+    apiLog.push({
+      method: req.method(),
+      path: u.replace(/^https?:\/\/[^/]+/, '').slice(0, 90),
+      status,
+      auth: h['authorization'] ? h['authorization'].slice(0, 16) + '…' : null,
+      cookieSent: !!h['cookie'],
+      x: xOf(h),
+    });
+    // Prefer the auth from a SUCCESSFUL call.
+    if (h['authorization'] && (!captured.authorization || status === 200)) {
+      captured.authorization = h['authorization'];
+      captured.extraHeaders = xOf(h);
+      captured.sampleUrl = u;
     }
-  }
+  } catch {}
 });
 
 log('Opening FIFA login…');
@@ -102,64 +115,55 @@ if (!landed.startsWith('https://play.fifa.com')) {
   process.exit(2);
 }
 
-// Drive the app so it fires its authenticated API calls (that's how we sniff the token).
-log('Loading Fantasy dashboard to capture the API token…');
-for (const url of ['https://play.fifa.com/fantasy', `https://play.fifa.com/fantasy/team/${TEAM_ID}`]) {
-  try { await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 }); } catch {}
-  await page.waitForTimeout(4000);
-  if (captured.authorization) break;
+// Let the SPA finish the OAuth code-exchange and load the dashboard ON ITS OWN.
+// (Hard-navigating away can abort the exchange, so we just wait and observe.)
+log('Letting the app load and fire its API calls…');
+await page.waitForTimeout(10000);
+// One gentle in-app nudge: click a nav link to the team/squad if present.
+for (const sel of ['a[href*="team" i]', 'a[href*="squad" i]', 'a[href*="fantasy" i]']) {
+  try { const el = await page.$(sel); if (el) { await el.click({ timeout: 3000 }); break; } } catch {}
 }
+await page.waitForTimeout(8000);
 
-// Also grab any token the app stashed in localStorage (fallback / extra context).
+// Dump the page's full localStorage + sessionStorage (the token may live in either).
+const webStorage = await page.evaluate(() => {
+  const grab = (s) => { const o = {}; for (let i = 0; i < s.length; i++) { const k = s.key(i); o[k] = String(s.getItem(k)).slice(0, 1200); } return o; };
+  return { origin: location.origin, localStorage: grab(localStorage), sessionStorage: grab(sessionStorage) };
+});
+
+// Try the token endpoint directly from the logged-in page (cookies auto-attached).
+const tokenProbe = await page.evaluate(async () => {
+  const get = async (u) => { try { const r = await fetch(u, { credentials: 'include', headers: { accept: 'application/json' } });
+    return { status: r.status, body: (await r.text()).slice(0, 300) }; } catch (e) { return { error: String(e) }; } };
+  return { userToken: await get('/api/en/user/token'), profile: await get('/api/en/fantasy/profile') };
+});
+
 const state = await ctx.storageState();
-const localStorageDump = {};
-for (const o of state.origins || []) {
-  for (const { name, value } of o.localStorage || []) {
-    if (/token|auth|jwt|access|id_token|session/i.test(name)) localStorageDump[`${o.origin}|${name}`] = value;
-  }
-}
-
-// Verify the captured token actually reads the team, replaying it server-side from the page.
-let verify = { skipped: 'no Authorization header captured' };
-if (captured.authorization) {
-  verify = await page.evaluate(async ({ teamId, auth, extra }) => {
-    const headers = { accept: 'application/json', authorization: auth, ...extra };
-    const get = async (u) => {
-      try { const r = await fetch(u, { headers, credentials: 'include' });
-        return { status: r.status, body: (await r.text()).slice(0, 300) }; }
-      catch (e) { return { error: String(e) }; }
-    };
-    return {
-      team: await get(`/api/en/fantasy/team/${teamId}`),
-      profile: await get(`/api/en/fantasy/profile`),
-    };
-  }, { teamId: TEAM_ID, auth: captured.authorization, extra: captured.extraHeaders });
-}
-
 writeFileSync('session.json', JSON.stringify(state, null, 2));
 
 const blob = Buffer.from(JSON.stringify({
   capturedAt: new Date().toISOString(),
   teamId: TEAM_ID,
+  landed,
   authorization: captured.authorization,
   extraHeaders: captured.extraHeaders,
   sampleUrl: captured.sampleUrl,
-  localStorage: localStorageDump,
+  apiLog,
+  tokenProbe,
+  webStorage,
   cookies: state.cookies.map(({ name, value, domain, path, expires, httpOnly, secure }) =>
     ({ name, value, domain, path, expires, httpOnly, secure })),
 })).toString('base64');
 writeFileSync('session.b64', blob);
 
-console.log('\n===== CAPTURE =====');
-console.log('Authorization captured:', captured.authorization ? captured.authorization.slice(0, 25) + '…' : 'NONE');
-console.log('Extra headers:', JSON.stringify(captured.extraHeaders));
-console.log('localStorage token keys:', Object.keys(localStorageDump));
-console.log('Verify:', JSON.stringify(verify, null, 2));
-
-const ok = verify?.team?.status === 200;
-console.log('\n===== RESULT =====');
-console.log(ok ? '✅ Captured a token that CAN read the team.'
-  : '⚠️  Captured login but team read returned ' + (verify?.team?.status ?? 'n/a') + '. Paste the blob anyway — the data helps.');
+console.log('\n===== DIAGNOSTIC CAPTURE =====');
+console.log('Final URL:', page.url());
+console.log('Authorization seen on any API call:', captured.authorization ? captured.authorization.slice(0, 25) + '…' : 'NONE');
+console.log('\nAPI calls the app made:');
+console.table(apiLog.map(({ method, path, status, auth, cookieSent }) => ({ method, path, status, auth, cookieSent })));
+console.log('\n/api/en/user/token probe:', JSON.stringify(tokenProbe.userToken));
+console.log('localStorage keys:', Object.keys(webStorage.localStorage));
+console.log('sessionStorage keys:', Object.keys(webStorage.sessionStorage));
 console.log('\n👉 Paste the ENTIRE line below back into the chat:\n');
 console.log('SESSION_B64:' + blob);
 
