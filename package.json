@@ -6,6 +6,7 @@
   "description": "MCP server for reading FIFA Fantasy teams (bootstrap + session-lifetime measurement phase)",
   "main": "index.js",
   "scripts": {
+    "team": "node team.mjs",
     "bootstrap": "node bootstrap.mjs",
     "measure": "node measure.mjs"
   },
