@@ -30,9 +30,9 @@ const cookieHeader = data.cookies
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
 
 async function call(path) {
-  const r = await fetch(`https://play.fifa.com${path}`, {
-    headers: { accept: 'application/json', cookie: cookieHeader, 'user-agent': UA },
-  });
+  const headers = { accept: 'application/json', cookie: cookieHeader, 'user-agent': UA, ...(data.extraHeaders || {}) };
+  if (data.authorization) headers.authorization = data.authorization;
+  const r = await fetch(`https://play.fifa.com${path}`, { headers });
   const body = await r.text();
   return { status: r.status, ok: r.status === 200, sample: body.slice(0, 120).replace(/\s+/g, ' ') };
 }

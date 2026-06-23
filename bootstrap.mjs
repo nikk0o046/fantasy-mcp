@@ -57,6 +57,24 @@ const ctx = await browser.newContext({
 });
 const page = await ctx.newPage();
 
+// Sniff the credentials the app actually uses on its API calls. The Fantasy data
+// API (proxied to Genius Sports) authenticates with an Authorization bearer token
+// and sometimes extra x-* headers — NOT cookies. We capture them from live traffic.
+const captured = { authorization: null, extraHeaders: {}, sampleUrl: null };
+const INTERESTING = /authorization|^x-|entity|tenant|api-key|token/i;
+page.on('request', (req) => {
+  const u = req.url();
+  if (!/\/api\/|geniussports\.com|f2p\.media/.test(u)) return;
+  const h = req.headers();
+  if (h['authorization']) {
+    captured.authorization = h['authorization'];
+    captured.sampleUrl = u;
+    for (const [k, v] of Object.entries(h)) {
+      if (INTERESTING.test(k) && k !== 'authorization' && k !== 'accept') captured.extraHeaders[k] = v;
+    }
+  }
+});
+
 log('Opening FIFA login…');
 await page.goto(AUTH_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 try { await page.click('#onetrust-accept-btn-handler', { timeout: 8000 }); log('Accepted cookies.'); } catch {}
@@ -84,41 +102,64 @@ if (!landed.startsWith('https://play.fifa.com')) {
   process.exit(2);
 }
 
-// Verify we can actually read the team, from the play.fifa.com origin (cookies auto-sent).
-log('Verifying team access…');
-const verify = await page.evaluate(async ({ teamId, gw }) => {
-  const get = async (u) => {
-    try { const r = await fetch(u, { credentials: 'include', headers: { accept: 'application/json' } });
-      return { url: u, status: r.status, body: (await r.text()).slice(0, 400) }; }
-    catch (e) { return { url: u, error: String(e) }; }
-  };
-  return {
-    team: await get(`/api/en/fantasy/team/${teamId}`),
-    teamGw: await get(`/api/en/fantasy/team/${teamId}/${gw}`),
-    profile: await get(`/api/en/fantasy/profile`),
-  };
-}, { teamId: TEAM_ID, gw: GW });
+// Drive the app so it fires its authenticated API calls (that's how we sniff the token).
+log('Loading Fantasy dashboard to capture the API token…');
+for (const url of ['https://play.fifa.com/fantasy', `https://play.fifa.com/fantasy/team/${TEAM_ID}`]) {
+  try { await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 }); } catch {}
+  await page.waitForTimeout(4000);
+  if (captured.authorization) break;
+}
 
-console.log('\n===== VERIFY =====');
-console.log(JSON.stringify(verify, null, 2));
-
-// Capture full session (all cookies across play.fifa.com + auth.fifa.com).
+// Also grab any token the app stashed in localStorage (fallback / extra context).
 const state = await ctx.storageState();
+const localStorageDump = {};
+for (const o of state.origins || []) {
+  for (const { name, value } of o.localStorage || []) {
+    if (/token|auth|jwt|access|id_token|session/i.test(name)) localStorageDump[`${o.origin}|${name}`] = value;
+  }
+}
+
+// Verify the captured token actually reads the team, replaying it server-side from the page.
+let verify = { skipped: 'no Authorization header captured' };
+if (captured.authorization) {
+  verify = await page.evaluate(async ({ teamId, auth, extra }) => {
+    const headers = { accept: 'application/json', authorization: auth, ...extra };
+    const get = async (u) => {
+      try { const r = await fetch(u, { headers, credentials: 'include' });
+        return { status: r.status, body: (await r.text()).slice(0, 300) }; }
+      catch (e) { return { error: String(e) }; }
+    };
+    return {
+      team: await get(`/api/en/fantasy/team/${teamId}`),
+      profile: await get(`/api/en/fantasy/profile`),
+    };
+  }, { teamId: TEAM_ID, auth: captured.authorization, extra: captured.extraHeaders });
+}
+
 writeFileSync('session.json', JSON.stringify(state, null, 2));
 
-// Compact blob: only the cookies, base64'd, for easy paste into chat.
 const blob = Buffer.from(JSON.stringify({
   capturedAt: new Date().toISOString(),
   teamId: TEAM_ID,
+  authorization: captured.authorization,
+  extraHeaders: captured.extraHeaders,
+  sampleUrl: captured.sampleUrl,
+  localStorage: localStorageDump,
   cookies: state.cookies.map(({ name, value, domain, path, expires, httpOnly, secure }) =>
     ({ name, value, domain, path, expires, httpOnly, secure })),
 })).toString('base64');
 writeFileSync('session.b64', blob);
 
-const ok = verify.team.status === 200;
+console.log('\n===== CAPTURE =====');
+console.log('Authorization captured:', captured.authorization ? captured.authorization.slice(0, 25) + '…' : 'NONE');
+console.log('Extra headers:', JSON.stringify(captured.extraHeaders));
+console.log('localStorage token keys:', Object.keys(localStorageDump));
+console.log('Verify:', JSON.stringify(verify, null, 2));
+
+const ok = verify?.team?.status === 200;
 console.log('\n===== RESULT =====');
-console.log(ok ? '✅ Session works and CAN read the team.' : '⚠️  Logged in but team read returned ' + verify.team.status + ' (check TEAM_ID).');
-console.log('\nSaved: session.json (full) + session.b64 (paste-friendly).');
+console.log(ok ? '✅ Captured a token that CAN read the team.'
+  : '⚠️  Captured login but team read returned ' + (verify?.team?.status ?? 'n/a') + '. Paste the blob anyway — the data helps.');
 console.log('\n👉 Paste the ENTIRE line below back into the chat:\n');
 console.log('SESSION_B64:' + blob);
 
